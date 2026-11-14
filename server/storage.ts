@@ -3,7 +3,9 @@ import path from 'path';
 import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
 import { ENV } from './_core/env';
 
-const LOCAL_STORAGE_DIR = path.resolve(process.cwd(), '.data/storage');
+const LOCAL_STORAGE_DIR = process.env.VERCEL
+  ? '/tmp/finance-agent-data/storage'
+  : path.resolve(process.cwd(), '.data/storage');
 
 function getS3Client(): S3Client | null {
   if (ENV.s3Bucket && ENV.s3AccessKeyId && ENV.s3SecretAccessKey) {

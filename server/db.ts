@@ -45,7 +45,9 @@ interface LocalDatabaseState {
   analyses: Analysis[];
 }
 
-const LOCAL_DB_PATH = path.resolve(process.cwd(), ".data/local-db.json");
+const LOCAL_DB_PATH = process.env.VERCEL
+  ? "/tmp/finance-agent-data/local-db.json"
+  : path.resolve(process.cwd(), ".data/local-db.json");
 
 function createSeedState(): LocalDatabaseState {
   const now = new Date("2026-11-14T10:00:00Z");

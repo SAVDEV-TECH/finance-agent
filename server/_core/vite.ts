@@ -2,9 +2,9 @@ import express, { type Express } from 'express';
 import fs from 'fs';
 import path from 'path';
 import type { Server } from 'http';
-import { createServer as createViteServer } from 'vite';
 
 export async function setupVite(app: Express, server: Server): Promise<void> {
+  const { createServer: createViteServer } = await import('vite');
   const vite = await createViteServer({
     server: {
       middlewareMode: true,
