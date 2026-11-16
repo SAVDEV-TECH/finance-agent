@@ -68,3 +68,6 @@ async function startServer() {
 if (!process.env.VERCEL) {
   startServer().catch(console.error);
 }
+
+export default createApp();
+
