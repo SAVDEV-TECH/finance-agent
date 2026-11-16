@@ -967,14 +967,27 @@ import { z as z3 } from "zod";
 // server/transactionParser.ts
 import Papa from "papaparse";
 import * as XLSX from "xlsx";
+var xlsxLib = XLSX.default ?? XLSX;
 function parseCSV(fileContent) {
   return new Promise((resolve, reject) => {
-    Papa.parse(fileContent, {
+    const lines = fileContent.split(/\r?\n/);
+    let headerIdx = 0;
+    for (let i = 0; i < Math.min(lines.length, 25); i++) {
+      const l = lines[i].toLowerCase();
+      if (l.includes("date") && (l.includes("desc") || l.includes("narrat") || l.includes("memo") || l.includes("amount") || l.includes("debit") || l.includes("credit"))) {
+        headerIdx = i;
+        break;
+      }
+    }
+    const normalizedCsv = lines.slice(headerIdx).join("\n");
+    Papa.parse(normalizedCsv, {
       header: true,
       skipEmptyLines: true,
       complete: (results) => {
         try {
-          const transactions2 = results.data.map((row) => parseTransactionRow(row)).filter((t2) => t2 !== null);
+          const transactions2 = results.data.map((row) => parseTransactionRow(row)).filter(
+            (t2) => t2 !== null
+          );
           resolve(transactions2);
         } catch (error) {
           reject(error);
@@ -986,31 +999,182 @@ function parseCSV(fileContent) {
     });
   });
 }
+function repairWorksheetRange(worksheet) {
+  let maxRow = 0;
+  let maxCol = 0;
+  let hasCells = false;
+  for (const key of Object.keys(worksheet)) {
+    if (key.startsWith("!")) continue;
+    const cell = xlsxLib.utils.decode_cell(key);
+    if (cell.r > maxRow) maxRow = cell.r;
+    if (cell.c > maxCol) maxCol = cell.c;
+    hasCells = true;
+  }
+  if (hasCells) {
+    worksheet["!ref"] = xlsxLib.utils.encode_range({
+      s: { r: 0, c: 0 },
+      e: { r: maxRow, c: maxCol }
+    });
+  }
+}
+function findHeaderRowIndex(rawRows) {
+  for (let i = 0; i < Math.min(rawRows.length, 30); i++) {
+    const row = rawRows[i];
+    if (!Array.isArray(row)) continue;
+    const nonEmptyCells = row.map((c) => String(c ?? "").toLowerCase().trim()).filter(Boolean);
+    if (nonEmptyCells.length < 2) continue;
+    if (parseDate(nonEmptyCells[0]) !== null) continue;
+    const joined = nonEmptyCells.join(" | ");
+    const hasDateCol = /\b(date|trans\.?\s*date|value\s*date|posted|time)\b/i.test(
+      joined
+    );
+    const hasValueOrDescCol = /\b(description|narration|memo|details|particulars|remarks|amount|debit|credit|withdrawal|deposit)\b/i.test(
+      joined
+    );
+    if (hasDateCol && hasValueOrDescCol) {
+      return i;
+    }
+  }
+  return -1;
+}
 function parseExcel(buffer) {
   try {
-    const workbook = XLSX.read(buffer, { type: "buffer" });
-    const sheetName = workbook.SheetNames[0];
-    if (!sheetName) {
+    const workbook = xlsxLib.read(buffer, { type: "buffer" });
+    if (!workbook.SheetNames || workbook.SheetNames.length === 0) {
       throw new Error("No sheets found in Excel file");
     }
-    const worksheet = workbook.Sheets[sheetName];
-    const rows = XLSX.utils.sheet_to_json(worksheet);
-    return rows.map((row) => parseTransactionRow(row)).filter((t2) => t2 !== null);
+    const allTransactions = [];
+    const seenReferences = /* @__PURE__ */ new Set();
+    let statementOwnerName = "";
+    for (let sIdx = 0; sIdx < workbook.SheetNames.length; sIdx++) {
+      const sheetName = workbook.SheetNames[sIdx];
+      const worksheet = workbook.Sheets[sheetName];
+      if (!worksheet) continue;
+      repairWorksheetRange(worksheet);
+      const rawRows = xlsxLib.utils.sheet_to_json(worksheet, {
+        header: 1,
+        defval: ""
+      });
+      if (rawRows.length === 0) continue;
+      let sheetAccountLabel = sheetName.replace(/\s*Transactions$/i, "").trim();
+      const detectedHeaderIdx = findHeaderRowIndex(rawRows);
+      const metaLimit = detectedHeaderIdx >= 0 ? detectedHeaderIdx : 0;
+      for (let m = 0; m < metaLimit; m++) {
+        const metaRow = rawRows[m];
+        if (!Array.isArray(metaRow)) continue;
+        for (let c = 0; c < metaRow.length - 1; c++) {
+          const k = String(metaRow[c] ?? "").toLowerCase().trim();
+          const v = String(metaRow[c + 1] ?? "").trim();
+          if (k === "account name" && v) {
+            statementOwnerName = v;
+          } else if (k === "account type" && v) {
+            sheetAccountLabel = v;
+          }
+        }
+      }
+      let headers;
+      let dataRows;
+      if (detectedHeaderIdx >= 0) {
+        const headerRow = rawRows[detectedHeaderIdx];
+        headers = headerRow.map((h, idx) => {
+          const clean = String(h ?? "").trim();
+          return clean || `col_${idx}`;
+        });
+        dataRows = rawRows.slice(detectedHeaderIdx + 1);
+      } else {
+        const firstNonEmptyIdx = rawRows.findIndex(
+          (r) => Array.isArray(r) && r.some((cell) => String(cell ?? "").trim() !== "")
+        );
+        const firstRow = firstNonEmptyIdx >= 0 ? rawRows[firstNonEmptyIdx] : [];
+        if (firstRow.length >= 6 && parseDate(firstRow[0]) && parseDate(firstRow[1])) {
+          headers = [
+            "Trans. Date",
+            "Value Date",
+            "Description",
+            "Debit",
+            "Credit",
+            "Balance After",
+            "Channel",
+            "Transaction Reference"
+          ];
+        } else {
+          headers = ["Date", "Description", "Amount", "Account"];
+        }
+        dataRows = firstNonEmptyIdx >= 0 ? rawRows.slice(firstNonEmptyIdx) : [];
+      }
+      for (const arrRow of dataRows) {
+        if (!Array.isArray(arrRow)) continue;
+        const rowObj = {};
+        let hasNonEmpty = false;
+        for (let c = 0; c < headers.length; c++) {
+          const val = arrRow[c];
+          if (val !== void 0 && val !== null && String(val).trim() !== "") {
+            hasNonEmpty = true;
+          }
+          rowObj[headers[c]] = val;
+        }
+        if (!hasNonEmpty) continue;
+        const txRef = findColumnValue(rowObj, [
+          "transaction reference",
+          "reference",
+          "ref",
+          "trans ref"
+        ]);
+        if (sIdx > 0 && txRef && seenReferences.has(String(txRef).trim())) {
+          continue;
+        }
+        const parsed = parseTransactionRow(
+          rowObj,
+          sheetAccountLabel,
+          statementOwnerName
+        );
+        if (parsed) {
+          if (txRef) {
+            seenReferences.add(String(txRef).trim());
+          }
+          allTransactions.push(parsed);
+        }
+      }
+    }
+    return allTransactions;
   } catch (error) {
     throw new Error(`Excel parsing error: ${error.message}`);
   }
 }
-function parseTransactionRow(row) {
-  const dateValue = findColumnValue(row, ["date", "Date", "transaction date", "Transaction Date", "posted date", "Posted Date"]);
+function parseTransactionRow(row, defaultAccount, ownerName) {
+  const dateValue = findColumnValue(row, [
+    "trans. date",
+    "trans date",
+    "transaction date",
+    "date",
+    "value date",
+    "posted date",
+    "posting date",
+    "booking date"
+  ]);
   if (!dateValue) return null;
   const date = parseDate(dateValue);
   if (!date) return null;
-  const description = findColumnValue(row, ["description", "Description", "memo", "Memo", "transaction", "Transaction", "details", "Details"]);
+  const description = findColumnValue(row, [
+    "description",
+    "narration",
+    "remarks",
+    "particulars",
+    "memo",
+    "transaction",
+    "details",
+    "transaction details"
+  ]);
   if (!description) return null;
   let amount = null;
   let originalAmount = "";
-  const amountValue = findColumnValue(row, ["amount", "Amount", "value", "Value"]);
-  if (amountValue) {
+  const amountValue = findColumnValue(row, [
+    "amount",
+    "value",
+    "transaction amount",
+    "net amount"
+  ]);
+  if (amountValue !== null) {
     const parsed = parseAmount(amountValue);
     if (parsed !== null) {
       amount = parsed.value;
@@ -1018,10 +1182,24 @@ function parseTransactionRow(row) {
     }
   }
   if (amount === null) {
-    const debitValue = findColumnValue(row, ["debit", "Debit", "withdrawal", "Withdrawal"]);
-    const creditValue = findColumnValue(row, ["credit", "Credit", "deposit", "Deposit"]);
-    const debitParsed = debitValue ? parseAmount(debitValue) : null;
-    const creditParsed = creditValue ? parseAmount(creditValue) : null;
+    const debitValue = findColumnValue(row, [
+      "debit",
+      "withdrawal",
+      "paid out",
+      "money out",
+      "dr",
+      "debit amount"
+    ]);
+    const creditValue = findColumnValue(row, [
+      "credit",
+      "deposit",
+      "paid in",
+      "money in",
+      "cr",
+      "credit amount"
+    ]);
+    const debitParsed = debitValue !== null ? parseAmount(debitValue) : null;
+    const creditParsed = creditValue !== null ? parseAmount(creditValue) : null;
     const hasDebit = debitParsed !== null && debitParsed.value !== 0;
     const hasCredit = creditParsed !== null && creditParsed.value !== 0;
     if (hasDebit) {
@@ -1033,24 +1211,49 @@ function parseTransactionRow(row) {
     }
   }
   if (amount === null) return null;
-  const account = findColumnValue(row, ["account", "Account", "account name", "Account Name", "source account", "Source Account"]);
+  const accountCol = findColumnValue(row, [
+    "account",
+    "account name",
+    "source account",
+    "channel"
+  ]);
+  let cleanDesc = String(description).replace(/\s+/g, " ").trim();
+  if (ownerName && cleanDesc.toLowerCase().startsWith("transfer to ")) {
+    const ownerTokens = ownerName.toLowerCase().split(/\s+/).filter((t2) => t2.length > 2);
+    const descLower = cleanDesc.toLowerCase();
+    const matchCount = ownerTokens.filter((t2) => descLower.includes(t2)).length;
+    if (ownerTokens.length >= 2 && matchCount >= 2 && !cleanDesc.includes("[Self Transfer]")) {
+      cleanDesc = `${cleanDesc} [Self Transfer]`;
+    }
+  }
   return {
     date,
-    description: String(description).trim(),
+    description: cleanDesc,
     amount,
     originalAmount,
-    account: account ? String(account).trim() : void 0
+    account: accountCol ? String(accountCol).trim() : defaultAccount || void 0
   };
 }
+function normalizeHeaderKey(key) {
+  return key.toLowerCase().replace(/\([^)]*\)/g, "").replace(/\./g, "").replace(/\s+/g, " ").trim();
+}
 function findColumnValue(row, columnNames) {
-  const lowercaseRow = {};
+  const exactMap = {};
+  const normalizedMap = {};
   for (const key of Object.keys(row)) {
-    lowercaseRow[key.toLowerCase().trim()] = row[key];
+    const val = row[key];
+    exactMap[key.toLowerCase().trim()] = val;
+    const norm = normalizeHeaderKey(key);
+    if (norm && !(norm in normalizedMap)) {
+      normalizedMap[norm] = val;
+    }
   }
   for (const name of columnNames) {
-    const val = lowercaseRow[name.toLowerCase().trim()];
-    if (val !== void 0 && val !== null && val !== "") {
-      return val;
+    const lower = name.toLowerCase().trim();
+    const norm = normalizeHeaderKey(name);
+    const candidate = exactMap[lower] ?? normalizedMap[norm];
+    if (candidate !== void 0 && candidate !== null && String(candidate).trim() !== "" && String(candidate).trim() !== "--") {
+      return candidate;
     }
   }
   return null;
@@ -1064,16 +1267,33 @@ function parseDate(dateStr) {
     return Number.isNaN(date2.getTime()) ? null : date2;
   }
   const str = String(dateStr).trim();
+  if (!str || str === "--") return null;
   const date = new Date(str);
-  if (isNaN(date.getTime())) {
-    return null;
+  if (!isNaN(date.getTime())) {
+    return date;
   }
-  return date;
+  const dmyMatch = str.match(
+    /^(\d{1,2})[/-](\d{1,2})[/-](\d{4})(?:\s+(\d{1,2}:\d{2}(?::\d{2})?))?$/
+  );
+  if (dmyMatch) {
+    const [, day, month, year, timePart] = dmyMatch;
+    const iso = `${year}-${month.padStart(2, "0")}-${day.padStart(2, "0")}${timePart ? `T${timePart}` : ""}`;
+    const parsedDmy = new Date(iso);
+    if (!isNaN(parsedDmy.getTime())) {
+      return parsedDmy;
+    }
+  }
+  return null;
 }
 function parseAmount(amountStr) {
-  if (!amountStr) return null;
+  if (amountStr === null || amountStr === void 0 || amountStr === "") {
+    return null;
+  }
   const original = String(amountStr).trim();
-  let cleaned = original.replace(/[$€£¥₹]/g, "").replace(/\s/g, "").replace(/,/g, "");
+  if (!original || original === "--" || original === "-" || original.toLowerCase() === "nil") {
+    return null;
+  }
+  let cleaned = original.replace(/[₦$€£¥₹]|NGN|USD|EUR|GBP/gi, "").replace(/\s/g, "").replace(/,/g, "");
   if (cleaned.startsWith("(") && cleaned.endsWith(")")) {
     cleaned = "-" + cleaned.slice(1, -1);
   }
@@ -1085,48 +1305,51 @@ function parseAmount(amountStr) {
 }
 function categorizeTransaction(description, amount) {
   const desc2 = description.toLowerCase();
-  if (desc2.includes("transfer") || desc2.includes("move between") || desc2.includes("account to account")) {
+  if (desc2.includes("auto-save to owealth") || desc2.includes("owealth withdrawal") || desc2.includes("spend & save") || desc2.includes("safebox deposit") || desc2.includes("safebox withdrawal") || desc2.includes("[self transfer]") || desc2.includes("move between") || desc2.includes("account to account") || desc2.includes("internal transfer")) {
     return { transactionType: "transfer", category: "transfer" };
   }
   if (amount > 0) {
-    if (desc2.includes("dividend") || desc2.includes("interest") || desc2.includes("investment")) {
+    if (desc2.includes("dividend") || desc2.includes("interest") || desc2.includes("owealth interest") || desc2.includes("cowrywise") || desc2.includes("piggyvest") || desc2.includes("bamboo") || desc2.includes("investment")) {
       return { transactionType: "income", category: "investment" };
     }
-    if (desc2.includes("bonus") || desc2.includes("refund")) {
+    if (desc2.includes("bonus") || desc2.includes("refund") || desc2.includes("cashback") || desc2.includes("reversal")) {
       return { transactionType: "income", category: "bonus" };
     }
-    if (desc2.includes("salary") || desc2.includes("paycheck") || desc2.includes("pay")) {
+    if (desc2.includes("salary") || desc2.includes("paycheck") || desc2.includes("payroll") || desc2.includes("stipend")) {
       return { transactionType: "income", category: "salary" };
+    }
+    if (desc2.startsWith("transfer from ") || desc2.includes("pos transfer") || desc2.includes("payment from")) {
+      return { transactionType: "income", category: "income" };
     }
     return { transactionType: "income", category: "other_income" };
   }
   if (amount < 0) {
     const absDesc = desc2;
-    if (absDesc.includes("grocery") || absDesc.includes("whole foods") || absDesc.includes("trader joe") || absDesc.includes("safeway") || absDesc.includes("kroger") || absDesc.includes("costco") || absDesc.includes("food market")) {
+    if (absDesc.includes("grocery") || absDesc.includes("whole foods") || absDesc.includes("trader joe") || absDesc.includes("safeway") || absDesc.includes("kroger") || absDesc.includes("costco") || absDesc.includes("food market") || absDesc.includes("supermarket") || absDesc.includes("shoprite") || absDesc.includes("spar ")) {
       return { transactionType: "expense", category: "groceries" };
     }
-    if (absDesc.includes("electric") || absDesc.includes("water") || absDesc.includes("gas") || absDesc.includes("utility") || absDesc.includes("internet") || absDesc.includes("phone bill")) {
+    if (absDesc.includes("airtime") || absDesc.includes("mobile data") || absDesc.includes("mtn") || absDesc.includes("airtel") || absDesc.includes("glo ") || absDesc.includes("9mobile") || absDesc.includes("electric") || absDesc.includes("prepaid") || absDesc.includes("ikedc") || absDesc.includes("ekedc") || absDesc.includes("phed") || absDesc.includes("aedc") || absDesc.includes("water") || absDesc.includes("utility") || absDesc.includes("internet") || absDesc.includes("phone bill") || absDesc.includes("dstv") || absDesc.includes("gotv") || absDesc.includes("startimes")) {
       return { transactionType: "expense", category: "utilities" };
     }
-    if (absDesc.includes("rent") || absDesc.includes("mortgage") || absDesc.includes("landlord")) {
+    if (absDesc.includes("rent") || absDesc.includes("mortgage") || absDesc.includes("landlord") || absDesc.includes("hostel") || absDesc.includes("accommodation")) {
       return { transactionType: "expense", category: "rent" };
     }
-    if (absDesc.includes("gas") || absDesc.includes("uber") || absDesc.includes("lyft") || absDesc.includes("parking") || absDesc.includes("transit") || absDesc.includes("car") || absDesc.includes("fuel")) {
+    if (absDesc.includes("uber") || absDesc.includes("lyft") || absDesc.includes("bolt") || absDesc.includes("indrive") || absDesc.includes("parking") || absDesc.includes("transit") || absDesc.includes("transport") || absDesc.includes("fuel") || absDesc.includes("filling station") || absDesc.includes("nnpc") || absDesc.includes("totalenergies") || absDesc.includes("conoil") || absDesc.includes("oando")) {
       return { transactionType: "expense", category: "transportation" };
     }
-    if (absDesc.includes("restaurant") || absDesc.includes("cafe") || absDesc.includes("coffee") || absDesc.includes("pizza") || absDesc.includes("burger") || absDesc.includes("sushi") || absDesc.includes("dining")) {
+    if (absDesc.includes("restaurant") || absDesc.includes("cafe") || absDesc.includes("coffee") || absDesc.includes("pizza") || absDesc.includes("burger") || absDesc.includes("sushi") || absDesc.includes("dining") || absDesc.includes("eatery") || absDesc.includes("chicken republic") || absDesc.includes("kilimanjaro") || absDesc.includes("crunches") || absDesc.includes("shawarma") || absDesc.includes("kitchen") || absDesc.includes("food")) {
       return { transactionType: "expense", category: "dining" };
     }
-    if (absDesc.includes("subscription") || absDesc.includes("monthly") || absDesc.includes("recurring") || absDesc.includes("membership") || absDesc.includes("netflix") || absDesc.includes("spotify")) {
+    if (absDesc.includes("subscription") || absDesc.includes("monthly") || absDesc.includes("recurring") || absDesc.includes("membership") || absDesc.includes("netflix") || absDesc.includes("spotify") || absDesc.includes("google play") || absDesc.includes("apple.com") || absDesc.includes("youtube") || absDesc.includes("chatgpt") || absDesc.includes("claude")) {
       return { transactionType: "expense", category: "subscriptions" };
     }
-    if (absDesc.includes("movie") || absDesc.includes("gaming") || absDesc.includes("concert") || absDesc.includes("entertainment")) {
+    if (absDesc.includes("movie") || absDesc.includes("gaming") || absDesc.includes("concert") || absDesc.includes("cinema") || absDesc.includes("filmhouse") || absDesc.includes("entertainment")) {
       return { transactionType: "expense", category: "entertainment" };
     }
-    if (absDesc.includes("amazon") || absDesc.includes("target") || absDesc.includes("walmart") || absDesc.includes("mall") || absDesc.includes("store") || absDesc.includes("retail")) {
+    if (absDesc.includes("amazon") || absDesc.includes("target") || absDesc.includes("walmart") || absDesc.includes("jumia") || absDesc.includes("konga") || absDesc.includes("mall") || absDesc.includes("store") || absDesc.includes("stores") || absDesc.includes("shop") || absDesc.includes("enterprise") || absDesc.includes("ventures") || absDesc.includes("global services") || absDesc.includes("retail") || absDesc.includes("market")) {
       return { transactionType: "expense", category: "shopping" };
     }
-    if (absDesc.includes("pharmacy") || absDesc.includes("doctor") || absDesc.includes("hospital") || absDesc.includes("medical") || absDesc.includes("cvs") || absDesc.includes("walgreens")) {
+    if (absDesc.includes("pharmacy") || absDesc.includes("doctor") || absDesc.includes("hospital") || absDesc.includes("medical") || absDesc.includes("clinic") || absDesc.includes("health") || absDesc.includes("cvs") || absDesc.includes("walgreens")) {
       return { transactionType: "expense", category: "healthcare" };
     }
     if (absDesc.includes("insurance") || absDesc.includes("premium")) {
@@ -1134,6 +1357,12 @@ function categorizeTransaction(description, amount) {
     }
     if (absDesc.includes("tuition") || absDesc.includes("school") || absDesc.includes("university") || absDesc.includes("course") || absDesc.includes("education")) {
       return { transactionType: "expense", category: "education" };
+    }
+    if (absDesc.includes("stamp duty") || absDesc.includes("ussd charge") || absDesc.includes("vat on transfer") || absDesc.includes("card application fee") || absDesc.includes("maintenance fee") || absDesc.includes("sms charge")) {
+      return { transactionType: "expense", category: "other_expense" };
+    }
+    if (absDesc.startsWith("transfer to ")) {
+      return { transactionType: "expense", category: "expense" };
     }
     return { transactionType: "expense", category: "other_expense" };
   }
@@ -1735,26 +1964,59 @@ var financeRouter = router({
       for (const batch of chunkArray(transactionsToInsert, 500)) {
         await createTransactions(batch);
       }
-      const totalIncome = parsedTransactions.filter((tx) => tx.amount > 0).reduce((sum, tx) => sum.plus(tx.amount), new Decimal2(0));
-      const totalExpenses = parsedTransactions.filter((tx) => tx.amount < 0).reduce((sum, tx) => sum.plus(tx.amount), new Decimal2(0));
-      const netCashFlow = totalIncome.plus(totalExpenses);
+      const freshMetrics = calculateFinancialMetrics(
+        transactionsToInsert.map((tx) => ({
+          amount: tx.amount,
+          category: tx.category,
+          transactionType: tx.transactionType,
+          date: tx.date
+        }))
+      );
+      const isNgn = parsedTransactions.some(
+        (t2) => /₦|opay|owealth|monie\s*point|kuda|palmpay|united bank for africa|access bank|first bank/i.test(
+          `${t2.description} ${t2.originalAmount}`
+        )
+      );
+      const sym = isNgn ? "\u20A6" : "$";
+      const topCats = freshMetrics.categoryBreakdown.filter((c) => c.transactionType !== "transfer").slice(0, 5);
+      const autoPrompt = `Analyze the following financial transaction data and provide 2-3 key insights about spending patterns, income sources, and financial health. Be concise and actionable.
+
+Financial Summary:
+- Total Income: ${sym}${freshMetrics.totalIncome}
+- Total Expenses: ${sym}${freshMetrics.totalExpenses}
+- Net Cash Flow: ${sym}${freshMetrics.netCashFlow}
+- Transaction Count: ${parsedTransactions.length}
+
+Top Categories:
+${topCats.map((c) => `- ${c.category}: ${c.count} transactions, ${sym}${c.total}`).join("\n")}`;
+      const llmRes = await invokeLLM({
+        messages: [
+          {
+            role: "system",
+            content: "You are a financial analyst providing insights on personal spending patterns."
+          },
+          { role: "user", content: autoPrompt }
+        ]
+      });
+      const initialInsights = llmRes.choices[0]?.message?.content || null;
       await createAnalysis({
         userId,
         fileUploadId,
-        totalIncome: totalIncome.toFixed(2),
-        totalExpenses: totalExpenses.abs().toFixed(2),
-        netCashFlow: netCashFlow.toFixed(2),
-        topCategories: JSON.stringify([]),
-        insights: null,
+        totalIncome: freshMetrics.totalIncome,
+        totalExpenses: freshMetrics.totalExpenses,
+        netCashFlow: freshMetrics.netCashFlow,
+        topCategories: JSON.stringify(topCats),
+        insights: initialInsights,
         reportUrl: null
       });
       return {
         fileUploadId,
         fileUrl,
         transactionCount: parsedTransactions.length,
-        totalIncome: totalIncome.toFixed(2),
-        totalExpenses: totalExpenses.abs().toFixed(2),
-        netCashFlow: netCashFlow.toFixed(2)
+        totalIncome: freshMetrics.totalIncome,
+        totalExpenses: freshMetrics.totalExpenses,
+        netCashFlow: freshMetrics.netCashFlow,
+        detectedCurrency: sym
       };
     } catch (error) {
       throw new Error(`File processing failed: ${error.message}`);

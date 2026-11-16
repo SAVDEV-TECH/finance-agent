@@ -149,9 +149,12 @@ export function App() {
         {/* Left Sidebar: Uploader + Custom Ledger Creator + Statement Selector */}
         <aside className="sidebar-column" aria-label="Statement management">
           <StatementUploader
-            onUploadSuccess={(newId) => {
+            onUploadSuccess={(newId, detectedCurrency) => {
               setSelectedCategoryFilter('all');
               setSelectedUploadId(newId);
+              if (detectedCurrency) {
+                setCurrencySymbol(detectedCurrency);
+              }
             }}
           />
 

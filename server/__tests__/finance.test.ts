@@ -69,6 +69,71 @@ describe('Finance Agent Unit Suite', () => {
     expect(parsed[1].amount).toBe(-112.4);
   });
 
+  it('parses OPay / bank Excel statements with metadata preambles, truncated !ref, Debit(₦)/Credit(₦) headers, and "--" placeholders', () => {
+    const aoa = [
+      ['Wallet Account Statement', '', '', '', 'Date Printed', '16 Nov 2026'],
+      ['Account Name', 'SAVIOUR HENRY SAMUEL', 'Account Number', '9037624245'],
+      ['Account Type', 'Wallet Account', 'Period', '16 Oct 2026-15 Nov 2026'],
+      [],
+      [
+        'Trans. Date',
+        'Value Date',
+        'Description',
+        'Debit(₦)',
+        'Credit(₦)',
+        'Balance After(₦)',
+        'Channel',
+        'Transaction Reference',
+      ],
+      [
+        '18 Oct 2026 21:14:26',
+        '18 Oct 2026',
+        'Transfer from MOG SHOP SERVICES | OPay',
+        '--',
+        '20,000.00',
+        '20,000.00',
+        'POS',
+        'REF001',
+      ],
+      [
+        '18 Oct 2026 21:15:34',
+        '18 Oct 2026',
+        'Auto-save to OWealth Balance',
+        '20,000.00',
+        '--',
+        '0.00',
+        'Mobile',
+        'REF002',
+      ],
+      [
+        '22 Oct 2026 19:58:17',
+        '22 Oct 2026',
+        'Airtime | 9037624245 | MTN',
+        '919.00',
+        '--',
+        '0.00',
+        'Mobile',
+        'REF003',
+      ],
+    ];
+    const ws = XLSX.utils.aoa_to_sheet(aoa);
+    // Simulate OPay truncated dimension tag that skips header rows
+    ws['!ref'] = 'A6:H8';
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, 'Wallet Account Transactions');
+    const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' }) as Buffer;
+
+    const parsed = parseExcel(buf);
+    expect(parsed).toHaveLength(3);
+    expect(parsed[0].amount).toBe(20000);
+    expect(parsed[1].amount).toBe(-20000);
+    expect(parsed[2].amount).toBe(-919);
+
+    expect(categorizeTransaction(parsed[0].description, parsed[0].amount).transactionType).toBe('income');
+    expect(categorizeTransaction(parsed[1].description, parsed[1].amount).transactionType).toBe('transfer');
+    expect(categorizeTransaction(parsed[2].description, parsed[2].amount).category).toBe('utilities');
+  });
+
   it('categorizes known and ambiguous transactions using deterministic + heuristic AI rules', async () => {
     const basic = categorizeTransaction('WHOLE FOODS MARKET', -82.1);
     expect(basic.category).toBe('groceries');

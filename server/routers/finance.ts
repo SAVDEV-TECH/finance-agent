@@ -107,24 +107,57 @@ export const financeRouter = router({
           await createTransactions(batch);
         }
 
-        const totalIncome = parsedTransactions
-          .filter((tx) => tx.amount > 0)
-          .reduce((sum, tx) => sum.plus(tx.amount), new Decimal(0));
+        const freshMetrics = calculateFinancialMetrics(
+          transactionsToInsert.map((tx) => ({
+            amount: tx.amount,
+            category: tx.category,
+            transactionType: tx.transactionType,
+            date: tx.date,
+          }))
+        );
 
-        const totalExpenses = parsedTransactions
-          .filter((tx) => tx.amount < 0)
-          .reduce((sum, tx) => sum.plus(tx.amount), new Decimal(0));
+        const isNgn = parsedTransactions.some((t) =>
+          /₦|opay|owealth|monie\s*point|kuda|palmpay|united bank for africa|access bank|first bank/i.test(
+            `${t.description} ${t.originalAmount}`
+          )
+        );
+        const sym = isNgn ? '₦' : '$';
 
-        const netCashFlow = totalIncome.plus(totalExpenses);
+        const topCats = freshMetrics.categoryBreakdown
+          .filter((c) => c.transactionType !== 'transfer')
+          .slice(0, 5);
+
+        const autoPrompt = `Analyze the following financial transaction data and provide 2-3 key insights about spending patterns, income sources, and financial health. Be concise and actionable.
+
+Financial Summary:
+- Total Income: ${sym}${freshMetrics.totalIncome}
+- Total Expenses: ${sym}${freshMetrics.totalExpenses}
+- Net Cash Flow: ${sym}${freshMetrics.netCashFlow}
+- Transaction Count: ${parsedTransactions.length}
+
+Top Categories:
+${topCats.map((c) => `- ${c.category}: ${c.count} transactions, ${sym}${c.total}`).join('\n')}`;
+
+        const llmRes = await invokeLLM({
+          messages: [
+            {
+              role: 'system',
+              content:
+                'You are a financial analyst providing insights on personal spending patterns.',
+            },
+            { role: 'user', content: autoPrompt },
+          ],
+        });
+        const initialInsights = llmRes.choices[0]?.message?.content || null;
 
         await createAnalysis({
           userId,
           fileUploadId,
-          totalIncome: totalIncome.toFixed(2),
-          totalExpenses: totalExpenses.abs().toFixed(2),
-          netCashFlow: netCashFlow.toFixed(2),
-          topCategories: JSON.stringify([]),
-          insights: null,
+          totalIncome: freshMetrics.totalIncome,
+          totalExpenses: freshMetrics.totalExpenses,
+          netCashFlow: freshMetrics.netCashFlow,
+          topCategories: JSON.stringify(topCats),
+          insights: initialInsights,
           reportUrl: null,
         });
 
@@ -132,9 +165,10 @@ export const financeRouter = router({
           fileUploadId,
           fileUrl,
           transactionCount: parsedTransactions.length,
-          totalIncome: totalIncome.toFixed(2),
-          totalExpenses: totalExpenses.abs().toFixed(2),
-          netCashFlow: netCashFlow.toFixed(2),
+          totalIncome: freshMetrics.totalIncome,
+          totalExpenses: freshMetrics.totalExpenses,
+          netCashFlow: freshMetrics.netCashFlow,
+          detectedCurrency: sym,
         };
       } catch (error) {
         throw new Error(`File processing failed: ${(error as Error).message}`);

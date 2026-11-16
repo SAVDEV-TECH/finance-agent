@@ -3,7 +3,7 @@ import { Upload, FileSpreadsheet, Sparkles, Loader2 } from 'lucide-react';
 import { trpc } from '../lib/trpc';
 
 interface StatementUploaderProps {
-  onUploadSuccess: (fileUploadId: number) => void;
+  onUploadSuccess: (fileUploadId: number, detectedCurrency?: string) => void;
 }
 
 const SAMPLE_STATEMENT_CSV = `Date,Description,Amount,Account
@@ -51,7 +51,7 @@ export const StatementUploader: React.FC<StatementUploaderProps> = ({
         text: `Imported ${data.transactionCount} transactions.`,
       });
       await utils.finance.getFileUploads.invalidate();
-      onUploadSuccess(data.fileUploadId);
+      onUploadSuccess(data.fileUploadId, data.detectedCurrency);
     },
     onError: (err) => {
       setStatusMessage({
