@@ -7,9 +7,11 @@ import {
   Percent,
   Trash2,
   FolderOpen,
+  Plus,
 } from 'lucide-react';
 import { trpc } from './lib/trpc';
 import { StatementUploader } from './components/StatementUploader';
+import { AddTransactionPanel } from './components/AddTransactionPanel';
 import { CashFlowCharts } from './components/CashFlowCharts';
 import { AiInsightsPanel } from './components/AiInsightsPanel';
 import {
@@ -39,6 +41,7 @@ export function App() {
   const [currencySymbol, setCurrencySymbol] = useState<string>('$');
   const [selectedCategoryFilter, setSelectedCategoryFilter] =
     useState<string>('all');
+  const [newLedgerName, setNewLedgerName] = useState('');
 
   const utils = trpc.useUtils();
   const { data: user } = trpc.auth.me.useQuery();
@@ -71,6 +74,15 @@ export function App() {
     { enabled: activeUploadId !== null }
   );
 
+  const createLedgerMutation = trpc.finance.createLedger.useMutation({
+    onSuccess: async (data) => {
+      setNewLedgerName('');
+      await utils.finance.getFileUploads.invalidate();
+      setSelectedCategoryFilter('all');
+      setSelectedUploadId(data.fileUploadId);
+    },
+  });
+
   const deleteMutation = trpc.finance.deleteUpload.useMutation({
     onSuccess: async () => {
       await utils.finance.getFileUploads.invalidate();
@@ -90,7 +102,7 @@ export function App() {
             <div>
               <h1 className="brand-title">LedgerPulse Finance Agent</h1>
               <p className="brand-subtitle">
-                Automated Statement Parsing, Hybrid AI Categorization &amp; Cash Flow Advisory
+                Dynamic Statement Parsing, Live Transaction Logging &amp; AI Financial Advisory
               </p>
             </div>
           </div>
@@ -134,7 +146,7 @@ export function App() {
       </header>
 
       <div className="workspace-container">
-        {/* Left Sidebar: Uploader + Statement Selector */}
+        {/* Left Sidebar: Uploader + Custom Ledger Creator + Statement Selector */}
         <aside className="sidebar-column" aria-label="Statement management">
           <StatementUploader
             onUploadSuccess={(newId) => {
@@ -148,21 +160,58 @@ export function App() {
               <div>
                 <h2 className="card-title">
                   <FolderOpen size={17} />
-                  Imported Statements
+                  Active Ledgers &amp; Statements
                 </h2>
                 <p className="card-subtitle">
-                  {uploads.length} {uploads.length === 1 ? 'file' : 'files'} in workspace
+                  {uploads.length} {uploads.length === 1 ? 'ledger' : 'ledgers'} in workspace
                 </p>
               </div>
             </div>
             <div className="card-body">
+              <form
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  if (!newLedgerName.trim()) return;
+                  createLedgerMutation.mutate({
+                    ledgerName: newLedgerName.trim(),
+                  });
+                }}
+                style={{
+                  display: 'flex',
+                  gap: '0.45rem',
+                  marginBottom: '0.85rem',
+                }}
+              >
+                <input
+                  id="new-ledger-name-input"
+                  type="text"
+                  className="input-control"
+                  style={{ flex: 1, minWidth: 0 }}
+                  placeholder="New blank ledger name..."
+                  value={newLedgerName}
+                  onChange={(e) => setNewLedgerName(e.target.value)}
+                />
+                <button
+                  id="create-blank-ledger-btn"
+                  type="submit"
+                  className="btn btn-primary"
+                  disabled={
+                    createLedgerMutation.isPending || !newLedgerName.trim()
+                  }
+                  title="Create a new empty ledger"
+                >
+                  <Plus size={14} />
+                  Create
+                </button>
+              </form>
+
               {uploadsLoading ? (
                 <p style={{ fontSize: '0.82rem', color: 'var(--text-muted)' }}>
-                  Loading statements...
+                  Loading ledgers...
                 </p>
               ) : uploads.length === 0 ? (
                 <p style={{ fontSize: '0.82rem', color: 'var(--text-muted)' }}>
-                  No statements imported yet. Upload a CSV, XLSX, DOCX, or PDF above.
+                  No ledgers yet. Create a blank ledger above or upload a CSV, XLSX, DOCX, or PDF statement.
                 </p>
               ) : (
                 <div className="statement-list">
@@ -191,7 +240,7 @@ export function App() {
                           id={`delete-statement-${u.id}`}
                           type="button"
                           className="btn btn-danger-ghost"
-                          title="Delete statement"
+                          title="Delete ledger"
                           disabled={deleteMutation.isPending}
                           onClick={(e) => {
                             e.stopPropagation();
@@ -214,7 +263,7 @@ export function App() {
           {activeUploadId === null ? (
             <div className="surface-card" style={{ padding: '3rem 2rem', textAlign: 'center' }}>
               <h2 style={{ fontSize: '1.15rem', fontWeight: 600 }}>
-                Ready to Analyze Your Financial Statements
+                Create a Ledger or Upload a Bank Statement
               </h2>
               <p
                 style={{
@@ -224,8 +273,7 @@ export function App() {
                   fontSize: '0.9rem',
                 }}
               >
-                Upload a CSV, Excel, Word, or PDF bank statement on the left—or click{' '}
-                <strong>Load Sample Statement</strong> to explore live categorization and AI insights.
+                Enter a name under <strong>Active Ledgers &amp; Statements</strong> on the left to start a blank ledger, or upload a CSV, Excel, Word, or PDF bank statement.
               </p>
             </div>
           ) : (
@@ -300,7 +348,13 @@ export function App() {
                 </div>
               </section>
 
-              {/* AI Financial Analyst Insights */}
+              {/* Dynamic Live Transaction Entry Bar */}
+              <AddTransactionPanel
+                fileUploadId={activeUploadId}
+                currencySymbol={currencySymbol}
+              />
+
+              {/* AI Financial Analyst Insights & Interactive Q&A */}
               <AiInsightsPanel
                 fileUploadId={activeUploadId}
                 currencySymbol={currencySymbol}

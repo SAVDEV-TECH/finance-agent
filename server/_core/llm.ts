@@ -76,16 +76,24 @@ export async function invokeStructuredLLM<T extends z.ZodTypeAny>(options: {
  * ensuring the app works out-of-the-box in local and demo environments.
  */
 function buildDeterministicFinancialInsights(userPrompt: string): string {
+  const questionMatch = userPrompt.match(/User Question:\s*([^\n]+)/i);
   const incomeMatch = userPrompt.match(/Total Income:\s*([^\n]+)/i);
   const expenseMatch = userPrompt.match(/Total Expenses:\s*([^\n]+)/i);
   const netMatch = userPrompt.match(/Net Cash Flow:\s*([^\n]+)/i);
   const countMatch = userPrompt.match(/Transaction Count:\s*(\d+)/i);
-  const topSection = userPrompt.split(/Top Categories:/i)[1] || '';
+  const avgExpMatch = userPrompt.match(/Average Expense:\s*([^\n]+)/i);
+  const maxExpMatch = userPrompt.match(/Largest Expense:\s*([^\n]+)/i);
+  const topSection =
+    userPrompt.split(/Top Categories:/i)[1]?.split(/Recent Transactions:/i)[0] ||
+    '';
+  const txSection = userPrompt.split(/Recent Transactions:/i)[1] || '';
 
   const incomeStr = incomeMatch?.[1]?.trim() || '$0.00';
   const expenseStr = expenseMatch?.[1]?.trim() || '$0.00';
   const netStr = netMatch?.[1]?.trim() || '$0.00';
   const txCount = countMatch?.[1] || '0';
+  const avgExpStr = avgExpMatch?.[1]?.trim() || '$0.00';
+  const maxExpStr = maxExpMatch?.[1]?.trim() || '$0.00';
 
   const parseNum = (s: string) =>
     parseFloat(s.replace(/[^0-9.-]/g, '')) || 0;
@@ -98,8 +106,66 @@ function buildDeterministicFinancialInsights(userPrompt: string): string {
     .split('\n')
     .map((l) => l.trim())
     .filter((l) => l.startsWith('-'))
-    .slice(0, 3)
     .map((l) => l.replace(/^-\s*/, ''));
+
+  if (questionMatch) {
+    const q = questionMatch[1].trim().toLowerCase();
+    const txLines = txSection
+      .split('\n')
+      .map((l) => l.trim())
+      .filter(Boolean);
+
+    // Check if the user asked about a specific category or merchant keyword
+    const matchedCategory = categoryLines.find((line) => {
+      const catName = line.split(/[(:]/)[0].trim().toLowerCase();
+      return q.includes(catName);
+    });
+
+    const matchedTx = txLines.filter((line) => {
+      const parts = line.split('|').map((p) => p.trim());
+      const desc = (parts[1] || '').toLowerCase();
+      const cat = (parts[3] || '').toLowerCase();
+      return q
+        .split(/\s+/)
+        .filter((w) => w.length > 3)
+        .some((word) => desc.includes(word) || cat.includes(word));
+    });
+
+    if (matchedCategory || matchedTx.length > 0) {
+      const details: string[] = [];
+      if (matchedCategory) {
+        details.push(`**Category Breakdown:** ${matchedCategory}.`);
+      }
+      if (matchedTx.length > 0) {
+        details.push(
+          `**Matching Transactions (${matchedTx.length}):** ${matchedTx
+            .slice(0, 4)
+            .join(' • ')}`
+        );
+      }
+      details.push(
+        `**Context vs. Overall Budget:** Out of **${expenseStr}** total expenses and **${incomeStr}** total income (**${savingsRate}% savings rate**), net cash flow stands at **${netStr}**.`
+      );
+      return details.join('\n\n');
+    }
+
+    if (q.includes('afford') || q.includes('buy') || q.includes('spend')) {
+      const numInQ = parseNum(q);
+      if (numInQ > 0) {
+        const remainingAfter = net - numInQ;
+        return remainingAfter >= 0
+          ? `**Yes — Covered by Current Surplus:** Your current net cash flow is **${netStr}** (${incomeStr} income vs. ${expenseStr} expenses, **${savingsRate}% savings rate**). A purchase of **${numInQ.toLocaleString()}** leaves you with a positive surplus of **${remainingAfter.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}**.`
+          : `**Caution — Exceeds Current Net Surplus:** Your current net cash flow is **${netStr}**. Spending **${numInQ.toLocaleString()}** would create a net deficit of **${remainingAfter.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}** unless offset by reducing discretionary categories.`;
+      }
+    }
+
+    return [
+      `**Ledger Snapshot (${txCount} transactions):** Total Income is **${incomeStr}**, Total Expenses are **${expenseStr}** (avg expense **${avgExpStr}**, largest single expense **${maxExpStr}**), yielding a **Net Cash Flow of ${netStr}** (**${savingsRate}% savings rate**).`,
+      categoryLines.length > 0
+        ? `**Top Drivers:** ${categoryLines.slice(0, 4).join(' • ')}.`
+        : `**Tip:** Add or recategorize transactions in the table below to see updated breakdowns immediately.`,
+    ].join('\n\n');
+  }
 
   const healthAssessment =
     net > 0
@@ -110,7 +176,7 @@ function buildDeterministicFinancialInsights(userPrompt: string): string {
 
   const categoryInsight =
     categoryLines.length > 0
-      ? `Your highest-activity categories were **${categoryLines.join('**, **')}**. Auditing discretionary outflow in your top expense drivers is the fastest lever to improve monthly margin.`
+      ? `Your highest-activity categories were **${categoryLines.slice(0, 3).join('**, **')}**. Auditing discretionary outflow in your top expense drivers is the fastest lever to improve monthly margin.`
       : `Categorizing any remaining uncategorized transactions will sharpen visibility into your largest spending drivers.`;
 
   const recommendation =

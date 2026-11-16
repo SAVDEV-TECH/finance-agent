@@ -16,6 +16,7 @@ import {
   Filter,
   ChevronLeft,
   ChevronRight,
+  Trash2,
 } from 'lucide-react';
 import { trpc } from '../lib/trpc';
 import {
@@ -59,14 +60,21 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
   const [typeFilter, setTypeFilter] = useState<string>('all');
 
   const utils = trpc.useUtils();
+  const invalidateAll = async () => {
+    await Promise.all([
+      utils.finance.getTransactions.invalidate({ fileUploadId }),
+      utils.finance.getMetrics.invalidate({ fileUploadId }),
+      utils.finance.getAnalysis.invalidate({ fileUploadId }),
+      utils.finance.getFileUploads.invalidate(),
+    ]);
+  };
+
   const recategorizeMutation = trpc.finance.recategorize.useMutation({
-    onSuccess: async () => {
-      await Promise.all([
-        utils.finance.getTransactions.invalidate({ fileUploadId }),
-        utils.finance.getMetrics.invalidate({ fileUploadId }),
-        utils.finance.getAnalysis.invalidate({ fileUploadId }),
-      ]);
-    },
+    onSuccess: invalidateAll,
+  });
+
+  const deleteTxMutation = trpc.finance.deleteTransaction.useMutation({
+    onSuccess: invalidateAll,
   });
 
   const filteredData = useMemo(() => {
@@ -189,8 +197,31 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
           );
         },
       }),
+      columnHelper.display({
+        id: 'actions',
+        header: '',
+        cell: (info) => {
+          const tx = info.row.original;
+          return (
+            <button
+              type="button"
+              className="btn btn-danger-ghost"
+              title="Delete transaction"
+              disabled={deleteTxMutation.isPending}
+              onClick={() =>
+                deleteTxMutation.mutate({
+                  transactionId: tx.id,
+                  fileUploadId,
+                })
+              }
+            >
+              <Trash2 size={14} />
+            </button>
+          );
+        },
+      }),
     ],
-    [currencySymbol, fileUploadId, recategorizeMutation]
+    [currencySymbol, fileUploadId, recategorizeMutation, deleteTxMutation]
   );
 
   const table = useReactTable({
@@ -238,7 +269,7 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
             Categorized Transaction Ledger
           </h2>
           <p className="card-subtitle">
-            Showing {filteredData.length} of {transactions.length} transactions — reassign any category inline to recalculate totals
+            Showing {filteredData.length} of {transactions.length} transactions — reassign any category inline or delete entries to recalculate totals live
           </p>
         </div>
 
@@ -365,7 +396,7 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
                     color: 'var(--text-muted)',
                   }}
                 >
-                  No transactions match your current filter criteria.
+                  No transactions in this view. Use the Log Live Transaction bar above or upload a statement file.
                 </td>
               </tr>
             ) : (

@@ -2,7 +2,7 @@ import { z } from 'zod';
 import { protectedProcedure, router } from '../_core/trpc';
 import { storagePut } from '../storage';
 import { parseCSV, parseExcel, categorizeTransaction, type ParsedTransaction, type TransactionCategory, type TransactionType } from '../transactionParser';
-import { createFileUpload, createTransactions, getFileUploadsByUser, getTransactionsByFileUpload, getAnalysisByFileUpload, createAnalysis, updateAnalysis, updateTransaction, deleteFileUpload } from '../db';
+import { createFileUpload, createTransactions, getFileUploadsByUser, getTransactionsByFileUpload, getAnalysisByFileUpload, createAnalysis, updateAnalysis, updateTransaction, deleteTransaction, syncFileUploadTransactionCount, deleteFileUpload } from '../db';
 import { invokeLLM } from '../_core/llm';
 import { classifyAmbiguousTransactions } from '../aiCategorization';
 import { calculateFinancialMetrics } from '../financeMetrics';
@@ -298,4 +298,262 @@ Provide insights in a professional, conversational tone.`;
       await deleteFileUpload(input.fileUploadId, ctx.user.id);
       return { success: true };
     }),
+
+  /**
+   * Create a new blank ledger so users can log transactions manually from scratch
+   */
+  createLedger: protectedProcedure
+    .input(
+      z.object({
+        ledgerName: z.string().min(1).max(200),
+      })
+    )
+    .mutation(async ({ ctx, input }) => {
+      const userId = ctx.user.id;
+      const cleanName = input.ledgerName.trim();
+      const fileUploadId = await createFileUpload({
+        userId,
+        fileName: cleanName,
+        fileKey: `${userId}-ledgers/${Date.now()}-${cleanName}`,
+        fileSize: 0,
+        fileType: 'manual',
+        transactionCount: 0,
+      });
+
+      await createAnalysis({
+        userId,
+        fileUploadId,
+        totalIncome: '0.00',
+        totalExpenses: '0.00',
+        netCashFlow: '0.00',
+        topCategories: JSON.stringify([]),
+        insights: null,
+        reportUrl: null,
+      });
+
+      return { fileUploadId, fileName: cleanName };
+    }),
+
+  /**
+   * Dynamically add a single transaction with automatic AI/heuristic categorization
+   */
+  addTransaction: protectedProcedure
+    .input(
+      z.object({
+        fileUploadId: z.number(),
+        date: z.string().min(1),
+        description: z.string().min(1).max(500),
+        amount: z.number(),
+        flowType: z.enum(['income', 'expense', 'transfer']),
+        category: z.string().default('auto'),
+        account: z.string().min(1).max(100).default('Primary Account'),
+      })
+    )
+    .mutation(async ({ ctx, input }) => {
+      const userId = ctx.user.id;
+      const signedAmount =
+        input.flowType === 'expense'
+          ? -Math.abs(input.amount)
+          : Math.abs(input.amount);
+
+      let finalCategory: TransactionCategory;
+      if (input.category === 'auto') {
+        const det = categorizeTransaction(input.description, signedAmount);
+        if (
+          det.category === 'other_income' ||
+          det.category === 'other_expense' ||
+          det.category === 'uncategorized'
+        ) {
+          const aiMap = await classifyAmbiguousTransactions([
+            {
+              index: 0,
+              description: input.description,
+              amount: signedAmount,
+            },
+          ]);
+          finalCategory = aiMap.get(0) ?? det.category;
+        } else {
+          finalCategory = det.category;
+        }
+      } else {
+        finalCategory = input.category as TransactionCategory;
+      }
+
+      const transactionType: TransactionType =
+        finalCategory === 'transfer' || input.flowType === 'transfer'
+          ? 'transfer'
+          : input.flowType === 'income' ||
+              [
+                'income',
+                'salary',
+                'bonus',
+                'investment',
+                'other_income',
+              ].includes(finalCategory)
+            ? 'income'
+            : 'expense';
+
+      const parsedDate = new Date(input.date);
+      const validDate = Number.isNaN(parsedDate.getTime())
+        ? new Date()
+        : parsedDate;
+
+      await createTransactions([
+        {
+          userId,
+          fileUploadId: input.fileUploadId,
+          date: validDate,
+          description: input.description.trim(),
+          amount: new Decimal(signedAmount).toFixed(2),
+          category: finalCategory,
+          transactionType,
+          account: input.account.trim() || 'Primary Account',
+          tags: JSON.stringify([
+            `type:${transactionType}`,
+            `category:${finalCategory}`,
+            'manual-entry',
+          ]),
+          notes: null,
+        },
+      ]);
+
+      await syncFileUploadTransactionCount(input.fileUploadId, userId);
+
+      const allRows = await getTransactionsByFileUpload(
+        input.fileUploadId,
+        userId
+      );
+      const freshMetrics = calculateFinancialMetrics(
+        allRows.map((row) => ({
+          amount: String(row.amount),
+          category: row.category,
+          transactionType: row.transactionType,
+          date: row.date,
+        }))
+      );
+      await updateAnalysis(input.fileUploadId, {
+        totalIncome: freshMetrics.totalIncome,
+        totalExpenses: freshMetrics.totalExpenses,
+        netCashFlow: freshMetrics.netCashFlow,
+      });
+
+      return {
+        success: true,
+        category: finalCategory,
+        transactionType,
+        metrics: freshMetrics,
+      };
+    }),
+
+  /**
+   * Delete a single transaction and recalculate ledger metrics
+   */
+  deleteTransaction: protectedProcedure
+    .input(
+      z.object({
+        transactionId: z.number(),
+        fileUploadId: z.number(),
+      })
+    )
+    .mutation(async ({ ctx, input }) => {
+      const userId = ctx.user.id;
+      await deleteTransaction(
+        input.transactionId,
+        input.fileUploadId,
+        userId
+      );
+
+      const allRows = await getTransactionsByFileUpload(
+        input.fileUploadId,
+        userId
+      );
+      const freshMetrics = calculateFinancialMetrics(
+        allRows.map((row) => ({
+          amount: String(row.amount),
+          category: row.category,
+          transactionType: row.transactionType,
+          date: row.date,
+        }))
+      );
+      await updateAnalysis(input.fileUploadId, {
+        totalIncome: freshMetrics.totalIncome,
+        totalExpenses: freshMetrics.totalExpenses,
+        netCashFlow: freshMetrics.netCashFlow,
+      });
+
+      return { success: true, metrics: freshMetrics };
+    }),
+
+  /**
+   * Ask the AI Financial Agent a free-form question about the active ledger
+   */
+  askAgent: protectedProcedure
+    .input(
+      z.object({
+        fileUploadId: z.number(),
+        question: z.string().min(2).max(600),
+        currencySymbol: z.string().max(4).default('$'),
+      })
+    )
+    .mutation(async ({ ctx, input }) => {
+      const transactions = await getTransactionsByFileUpload(
+        input.fileUploadId,
+        ctx.user.id
+      );
+      const metrics = calculateFinancialMetrics(
+        transactions.map((row) => ({
+          amount: String(row.amount),
+          category: row.category,
+          transactionType: row.transactionType,
+          date: row.date,
+        }))
+      );
+      const sym = input.currencySymbol;
+
+      const txDigest = transactions
+        .slice(0, 40)
+        .map(
+          (t) =>
+            `${new Date(t.date).toISOString().slice(0, 10)} | ${t.description} | ${sym}${t.amount} | ${t.category} (${t.transactionType})`
+        )
+        .join('\n');
+
+      const prompt = `User Question: ${input.question}
+
+Financial Summary:
+- Total Income: ${sym}${metrics.totalIncome}
+- Total Expenses: ${sym}${metrics.totalExpenses}
+- Net Cash Flow: ${sym}${metrics.netCashFlow}
+- Savings Rate: ${metrics.savingsRate}%
+- Transaction Count: ${metrics.transactionCount}
+- Average Expense: ${sym}${metrics.averageExpense}
+- Largest Expense: ${sym}${metrics.largestExpense}
+
+Top Categories:
+${metrics.categoryBreakdown
+  .slice(0, 8)
+  .map((c) => `- ${c.category} (${c.transactionType}): ${c.count} txns, ${sym}${c.total} (${c.percentage}%)`)
+  .join('\n')}
+
+Recent Transactions:
+${txDigest}`;
+
+      const response = await invokeLLM({
+        messages: [
+          {
+            role: 'system',
+            content:
+              'You are an interactive AI Financial Agent. Answer the user question directly and concisely using the exact numbers, merchants, and categories from their ledger.',
+          },
+          {
+            role: 'user',
+            content: prompt,
+          },
+        ],
+      });
+
+      const answer = response.choices[0]?.message?.content || '';
+      return { answer };
+    }),
 });
+

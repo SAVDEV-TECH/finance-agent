@@ -687,6 +687,52 @@ async function updateAnalysis(fileUploadId, data) {
   }
   return db.update(analyses).set(data).where(eq(analyses.fileUploadId, fileUploadId));
 }
+async function deleteTransaction(transactionId, fileUploadId, userId) {
+  const db = await getDb();
+  if (!db) {
+    const store = getLocalStore();
+    store.transactions = store.transactions.filter(
+      (t2) => !(t2.id === transactionId && t2.userId === userId)
+    );
+    const upload = store.fileUploads.find(
+      (f) => f.id === fileUploadId && f.userId === userId
+    );
+    if (upload) {
+      upload.transactionCount = store.transactions.filter(
+        (t2) => t2.fileUploadId === fileUploadId && t2.userId === userId
+      ).length;
+    }
+    saveLocalStore(store);
+    return;
+  }
+  await db.delete(transactions).where(
+    and(eq(transactions.id, transactionId), eq(transactions.userId, userId))
+  );
+  const remaining = await getTransactionsByFileUpload(fileUploadId, userId);
+  await db.update(fileUploads).set({ transactionCount: remaining.length }).where(
+    and(eq(fileUploads.id, fileUploadId), eq(fileUploads.userId, userId))
+  );
+}
+async function syncFileUploadTransactionCount(fileUploadId, userId) {
+  const db = await getDb();
+  if (!db) {
+    const store = getLocalStore();
+    const upload = store.fileUploads.find(
+      (f) => f.id === fileUploadId && f.userId === userId
+    );
+    if (upload) {
+      upload.transactionCount = store.transactions.filter(
+        (t2) => t2.fileUploadId === fileUploadId && t2.userId === userId
+      ).length;
+      saveLocalStore(store);
+    }
+    return;
+  }
+  const remaining = await getTransactionsByFileUpload(fileUploadId, userId);
+  await db.update(fileUploads).set({ transactionCount: remaining.length }).where(
+    and(eq(fileUploads.id, fileUploadId), eq(fileUploads.userId, userId))
+  );
+}
 async function deleteFileUpload(fileUploadId, userId) {
   const db = await getDb();
   if (!db) {
@@ -1134,23 +1180,69 @@ async function invokeStructuredLLM(options) {
   }
 }
 function buildDeterministicFinancialInsights(userPrompt) {
+  const questionMatch = userPrompt.match(/User Question:\s*([^\n]+)/i);
   const incomeMatch = userPrompt.match(/Total Income:\s*([^\n]+)/i);
   const expenseMatch = userPrompt.match(/Total Expenses:\s*([^\n]+)/i);
   const netMatch = userPrompt.match(/Net Cash Flow:\s*([^\n]+)/i);
   const countMatch = userPrompt.match(/Transaction Count:\s*(\d+)/i);
-  const topSection = userPrompt.split(/Top Categories:/i)[1] || "";
+  const avgExpMatch = userPrompt.match(/Average Expense:\s*([^\n]+)/i);
+  const maxExpMatch = userPrompt.match(/Largest Expense:\s*([^\n]+)/i);
+  const topSection = userPrompt.split(/Top Categories:/i)[1]?.split(/Recent Transactions:/i)[0] || "";
+  const txSection = userPrompt.split(/Recent Transactions:/i)[1] || "";
   const incomeStr = incomeMatch?.[1]?.trim() || "$0.00";
   const expenseStr = expenseMatch?.[1]?.trim() || "$0.00";
   const netStr = netMatch?.[1]?.trim() || "$0.00";
   const txCount = countMatch?.[1] || "0";
+  const avgExpStr = avgExpMatch?.[1]?.trim() || "$0.00";
+  const maxExpStr = maxExpMatch?.[1]?.trim() || "$0.00";
   const parseNum = (s) => parseFloat(s.replace(/[^0-9.-]/g, "")) || 0;
   const income = parseNum(incomeStr);
   const expenses = parseNum(expenseStr);
   const net2 = parseNum(netStr);
   const savingsRate = income > 0 ? (net2 / income * 100).toFixed(1) : "0.0";
-  const categoryLines = topSection.split("\n").map((l) => l.trim()).filter((l) => l.startsWith("-")).slice(0, 3).map((l) => l.replace(/^-\s*/, ""));
+  const categoryLines = topSection.split("\n").map((l) => l.trim()).filter((l) => l.startsWith("-")).map((l) => l.replace(/^-\s*/, ""));
+  if (questionMatch) {
+    const q = questionMatch[1].trim().toLowerCase();
+    const txLines = txSection.split("\n").map((l) => l.trim()).filter(Boolean);
+    const matchedCategory = categoryLines.find((line) => {
+      const catName = line.split(/[(:]/)[0].trim().toLowerCase();
+      return q.includes(catName);
+    });
+    const matchedTx = txLines.filter((line) => {
+      const parts = line.split("|").map((p) => p.trim());
+      const desc2 = (parts[1] || "").toLowerCase();
+      const cat = (parts[3] || "").toLowerCase();
+      return q.split(/\s+/).filter((w) => w.length > 3).some((word) => desc2.includes(word) || cat.includes(word));
+    });
+    if (matchedCategory || matchedTx.length > 0) {
+      const details = [];
+      if (matchedCategory) {
+        details.push(`**Category Breakdown:** ${matchedCategory}.`);
+      }
+      if (matchedTx.length > 0) {
+        details.push(
+          `**Matching Transactions (${matchedTx.length}):** ${matchedTx.slice(0, 4).join(" \u2022 ")}`
+        );
+      }
+      details.push(
+        `**Context vs. Overall Budget:** Out of **${expenseStr}** total expenses and **${incomeStr}** total income (**${savingsRate}% savings rate**), net cash flow stands at **${netStr}**.`
+      );
+      return details.join("\n\n");
+    }
+    if (q.includes("afford") || q.includes("buy") || q.includes("spend")) {
+      const numInQ = parseNum(q);
+      if (numInQ > 0) {
+        const remainingAfter = net2 - numInQ;
+        return remainingAfter >= 0 ? `**Yes \u2014 Covered by Current Surplus:** Your current net cash flow is **${netStr}** (${incomeStr} income vs. ${expenseStr} expenses, **${savingsRate}% savings rate**). A purchase of **${numInQ.toLocaleString()}** leaves you with a positive surplus of **${remainingAfter.toLocaleString(void 0, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}**.` : `**Caution \u2014 Exceeds Current Net Surplus:** Your current net cash flow is **${netStr}**. Spending **${numInQ.toLocaleString()}** would create a net deficit of **${remainingAfter.toLocaleString(void 0, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}** unless offset by reducing discretionary categories.`;
+      }
+    }
+    return [
+      `**Ledger Snapshot (${txCount} transactions):** Total Income is **${incomeStr}**, Total Expenses are **${expenseStr}** (avg expense **${avgExpStr}**, largest single expense **${maxExpStr}**), yielding a **Net Cash Flow of ${netStr}** (**${savingsRate}% savings rate**).`,
+      categoryLines.length > 0 ? `**Top Drivers:** ${categoryLines.slice(0, 4).join(" \u2022 ")}.` : `**Tip:** Add or recategorize transactions in the table below to see updated breakdowns immediately.`
+    ].join("\n\n");
+  }
   const healthAssessment = net2 > 0 ? `You maintained a **positive net cash flow of ${netStr}** across ${txCount} transactions, achieving a **${savingsRate}% savings rate** (${incomeStr} income vs. ${expenseStr} expenses).` : net2 < 0 ? `Your expenses (${expenseStr}) exceeded income (${incomeStr}) across ${txCount} transactions, resulting in a **net cash flow deficit of ${netStr}**.` : `Your cash flow broke even across ${txCount} transactions (${incomeStr} income vs. ${expenseStr} expenses).`;
-  const categoryInsight = categoryLines.length > 0 ? `Your highest-activity categories were **${categoryLines.join("**, **")}**. Auditing discretionary outflow in your top expense drivers is the fastest lever to improve monthly margin.` : `Categorizing any remaining uncategorized transactions will sharpen visibility into your largest spending drivers.`;
+  const categoryInsight = categoryLines.length > 0 ? `Your highest-activity categories were **${categoryLines.slice(0, 3).join("**, **")}**. Auditing discretionary outflow in your top expense drivers is the fastest lever to improve monthly margin.` : `Categorizing any remaining uncategorized transactions will sharpen visibility into your largest spending drivers.`;
   const recommendation = Number(savingsRate) >= 20 ? `With a strong ${savingsRate}% savings rate, consider automating surplus cash flow (${netStr}) into low-cost index investments or a high-yield reserve account.` : Number(savingsRate) > 0 ? `Aim to lift your current ${savingsRate}% savings rate toward the 20% benchmark by setting a monthly cap on variable dining, shopping, and subscription charges.` : `Prioritize trimming recurring subscriptions and non-essential discretionary categories to restore positive monthly cash flow.`;
   return [
     `1. **Cash Flow & Savings Health:** ${healthAssessment}`,
@@ -1806,6 +1898,213 @@ Provide insights in a professional, conversational tone.`;
   deleteUpload: protectedProcedure.input(z3.object({ fileUploadId: z3.number() })).mutation(async ({ ctx, input }) => {
     await deleteFileUpload(input.fileUploadId, ctx.user.id);
     return { success: true };
+  }),
+  /**
+   * Create a new blank ledger so users can log transactions manually from scratch
+   */
+  createLedger: protectedProcedure.input(
+    z3.object({
+      ledgerName: z3.string().min(1).max(200)
+    })
+  ).mutation(async ({ ctx, input }) => {
+    const userId = ctx.user.id;
+    const cleanName = input.ledgerName.trim();
+    const fileUploadId = await createFileUpload({
+      userId,
+      fileName: cleanName,
+      fileKey: `${userId}-ledgers/${Date.now()}-${cleanName}`,
+      fileSize: 0,
+      fileType: "manual",
+      transactionCount: 0
+    });
+    await createAnalysis({
+      userId,
+      fileUploadId,
+      totalIncome: "0.00",
+      totalExpenses: "0.00",
+      netCashFlow: "0.00",
+      topCategories: JSON.stringify([]),
+      insights: null,
+      reportUrl: null
+    });
+    return { fileUploadId, fileName: cleanName };
+  }),
+  /**
+   * Dynamically add a single transaction with automatic AI/heuristic categorization
+   */
+  addTransaction: protectedProcedure.input(
+    z3.object({
+      fileUploadId: z3.number(),
+      date: z3.string().min(1),
+      description: z3.string().min(1).max(500),
+      amount: z3.number(),
+      flowType: z3.enum(["income", "expense", "transfer"]),
+      category: z3.string().default("auto"),
+      account: z3.string().min(1).max(100).default("Primary Account")
+    })
+  ).mutation(async ({ ctx, input }) => {
+    const userId = ctx.user.id;
+    const signedAmount = input.flowType === "expense" ? -Math.abs(input.amount) : Math.abs(input.amount);
+    let finalCategory;
+    if (input.category === "auto") {
+      const det = categorizeTransaction(input.description, signedAmount);
+      if (det.category === "other_income" || det.category === "other_expense" || det.category === "uncategorized") {
+        const aiMap = await classifyAmbiguousTransactions([
+          {
+            index: 0,
+            description: input.description,
+            amount: signedAmount
+          }
+        ]);
+        finalCategory = aiMap.get(0) ?? det.category;
+      } else {
+        finalCategory = det.category;
+      }
+    } else {
+      finalCategory = input.category;
+    }
+    const transactionType = finalCategory === "transfer" || input.flowType === "transfer" ? "transfer" : input.flowType === "income" || [
+      "income",
+      "salary",
+      "bonus",
+      "investment",
+      "other_income"
+    ].includes(finalCategory) ? "income" : "expense";
+    const parsedDate = new Date(input.date);
+    const validDate = Number.isNaN(parsedDate.getTime()) ? /* @__PURE__ */ new Date() : parsedDate;
+    await createTransactions([
+      {
+        userId,
+        fileUploadId: input.fileUploadId,
+        date: validDate,
+        description: input.description.trim(),
+        amount: new Decimal2(signedAmount).toFixed(2),
+        category: finalCategory,
+        transactionType,
+        account: input.account.trim() || "Primary Account",
+        tags: JSON.stringify([
+          `type:${transactionType}`,
+          `category:${finalCategory}`,
+          "manual-entry"
+        ]),
+        notes: null
+      }
+    ]);
+    await syncFileUploadTransactionCount(input.fileUploadId, userId);
+    const allRows = await getTransactionsByFileUpload(
+      input.fileUploadId,
+      userId
+    );
+    const freshMetrics = calculateFinancialMetrics(
+      allRows.map((row) => ({
+        amount: String(row.amount),
+        category: row.category,
+        transactionType: row.transactionType,
+        date: row.date
+      }))
+    );
+    await updateAnalysis(input.fileUploadId, {
+      totalIncome: freshMetrics.totalIncome,
+      totalExpenses: freshMetrics.totalExpenses,
+      netCashFlow: freshMetrics.netCashFlow
+    });
+    return {
+      success: true,
+      category: finalCategory,
+      transactionType,
+      metrics: freshMetrics
+    };
+  }),
+  /**
+   * Delete a single transaction and recalculate ledger metrics
+   */
+  deleteTransaction: protectedProcedure.input(
+    z3.object({
+      transactionId: z3.number(),
+      fileUploadId: z3.number()
+    })
+  ).mutation(async ({ ctx, input }) => {
+    const userId = ctx.user.id;
+    await deleteTransaction(
+      input.transactionId,
+      input.fileUploadId,
+      userId
+    );
+    const allRows = await getTransactionsByFileUpload(
+      input.fileUploadId,
+      userId
+    );
+    const freshMetrics = calculateFinancialMetrics(
+      allRows.map((row) => ({
+        amount: String(row.amount),
+        category: row.category,
+        transactionType: row.transactionType,
+        date: row.date
+      }))
+    );
+    await updateAnalysis(input.fileUploadId, {
+      totalIncome: freshMetrics.totalIncome,
+      totalExpenses: freshMetrics.totalExpenses,
+      netCashFlow: freshMetrics.netCashFlow
+    });
+    return { success: true, metrics: freshMetrics };
+  }),
+  /**
+   * Ask the AI Financial Agent a free-form question about the active ledger
+   */
+  askAgent: protectedProcedure.input(
+    z3.object({
+      fileUploadId: z3.number(),
+      question: z3.string().min(2).max(600),
+      currencySymbol: z3.string().max(4).default("$")
+    })
+  ).mutation(async ({ ctx, input }) => {
+    const transactions2 = await getTransactionsByFileUpload(
+      input.fileUploadId,
+      ctx.user.id
+    );
+    const metrics = calculateFinancialMetrics(
+      transactions2.map((row) => ({
+        amount: String(row.amount),
+        category: row.category,
+        transactionType: row.transactionType,
+        date: row.date
+      }))
+    );
+    const sym = input.currencySymbol;
+    const txDigest = transactions2.slice(0, 40).map(
+      (t2) => `${new Date(t2.date).toISOString().slice(0, 10)} | ${t2.description} | ${sym}${t2.amount} | ${t2.category} (${t2.transactionType})`
+    ).join("\n");
+    const prompt = `User Question: ${input.question}
+
+Financial Summary:
+- Total Income: ${sym}${metrics.totalIncome}
+- Total Expenses: ${sym}${metrics.totalExpenses}
+- Net Cash Flow: ${sym}${metrics.netCashFlow}
+- Savings Rate: ${metrics.savingsRate}%
+- Transaction Count: ${metrics.transactionCount}
+- Average Expense: ${sym}${metrics.averageExpense}
+- Largest Expense: ${sym}${metrics.largestExpense}
+
+Top Categories:
+${metrics.categoryBreakdown.slice(0, 8).map((c) => `- ${c.category} (${c.transactionType}): ${c.count} txns, ${sym}${c.total} (${c.percentage}%)`).join("\n")}
+
+Recent Transactions:
+${txDigest}`;
+    const response = await invokeLLM({
+      messages: [
+        {
+          role: "system",
+          content: "You are an interactive AI Financial Agent. Answer the user question directly and concisely using the exact numbers, merchants, and categories from their ledger."
+        },
+        {
+          role: "user",
+          content: prompt
+        }
+      ]
+    });
+    const answer = response.choices[0]?.message?.content || "";
+    return { answer };
   })
 });
 
@@ -1887,17 +2186,30 @@ async function findAvailablePort(startPort = 3e3) {
 }
 function createApp() {
   const app = express2();
+  app.use((req, _res, next) => {
+    try {
+      const parsed = new URL(req.url || "/", "http://localhost");
+      const apiPath = parsed.searchParams.get("__api_path");
+      if (apiPath) {
+        parsed.searchParams.delete("__api_path");
+        const search = parsed.searchParams.toString();
+        const normalizedPath = apiPath.replace(/^\/+/, "");
+        req.url = `/api/${normalizedPath}${search ? `?${search}` : ""}`;
+      }
+    } catch {
+    }
+    next();
+  });
   app.use(express2.json({ limit: "50mb" }));
   app.use(express2.urlencoded({ limit: "50mb", extended: true }));
   registerStorageProxy(app);
   registerOAuthRoutes(app);
-  app.use(
-    "/api/trpc",
-    createExpressMiddleware({
-      router: appRouter,
-      createContext
-    })
-  );
+  const trpcMiddleware = createExpressMiddleware({
+    router: appRouter,
+    createContext
+  });
+  app.use("/api/trpc", trpcMiddleware);
+  app.use("/trpc", trpcMiddleware);
   return app;
 }
 async function startServer() {

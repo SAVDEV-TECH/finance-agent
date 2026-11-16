@@ -30,17 +30,36 @@ async function findAvailablePort(startPort: number = 3000): Promise<number> {
 
 export function createApp() {
   const app = express();
+
+  // Normalize Vercel rewritten /api?__api_path=... URLs back to /api/...
+  app.use((req, _res, next) => {
+    try {
+      const parsed = new URL(req.url || "/", "http://localhost");
+      const apiPath = parsed.searchParams.get("__api_path");
+      if (apiPath) {
+        parsed.searchParams.delete("__api_path");
+        const search = parsed.searchParams.toString();
+        const normalizedPath = apiPath.replace(/^\/+/, "");
+        req.url = `/api/${normalizedPath}${search ? `?${search}` : ""}`;
+      }
+    } catch {
+      // Keep original req.url if parsing fails
+    }
+    next();
+  });
+
   app.use(express.json({ limit: "50mb" }));
   app.use(express.urlencoded({ limit: "50mb", extended: true }));
   registerStorageProxy(app);
   registerOAuthRoutes(app);
-  app.use(
-    "/api/trpc",
-    createExpressMiddleware({
-      router: appRouter,
-      createContext,
-    })
-  );
+
+  const trpcMiddleware = createExpressMiddleware({
+    router: appRouter,
+    createContext,
+  });
+  app.use("/api/trpc", trpcMiddleware);
+  app.use("/trpc", trpcMiddleware);
+
   return app;
 }
 
@@ -70,4 +89,3 @@ if (!process.env.VERCEL) {
 }
 
 export default createApp();
-

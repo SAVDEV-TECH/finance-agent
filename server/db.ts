@@ -752,6 +752,72 @@ export async function updateAnalysis(
 }
 
 /**
+ * Delete a single transaction and update its parent fileUpload transactionCount.
+ */
+export async function deleteTransaction(
+  transactionId: number,
+  fileUploadId: number,
+  userId: number
+) {
+  const db = await getDb();
+  if (!db) {
+    const store = getLocalStore();
+    store.transactions = store.transactions.filter(
+      (t) => !(t.id === transactionId && t.userId === userId)
+    );
+    const upload = store.fileUploads.find(
+      (f) => f.id === fileUploadId && f.userId === userId
+    );
+    if (upload) {
+      upload.transactionCount = store.transactions.filter(
+        (t) => t.fileUploadId === fileUploadId && t.userId === userId
+      ).length;
+    }
+    saveLocalStore(store);
+    return;
+  }
+  await db
+    .delete(transactions)
+    .where(
+      and(eq(transactions.id, transactionId), eq(transactions.userId, userId))
+    );
+  const remaining = await getTransactionsByFileUpload(fileUploadId, userId);
+  await db
+    .update(fileUploads)
+    .set({ transactionCount: remaining.length })
+    .where(
+      and(eq(fileUploads.id, fileUploadId), eq(fileUploads.userId, userId))
+    );
+}
+
+export async function syncFileUploadTransactionCount(
+  fileUploadId: number,
+  userId: number
+) {
+  const db = await getDb();
+  if (!db) {
+    const store = getLocalStore();
+    const upload = store.fileUploads.find(
+      (f) => f.id === fileUploadId && f.userId === userId
+    );
+    if (upload) {
+      upload.transactionCount = store.transactions.filter(
+        (t) => t.fileUploadId === fileUploadId && t.userId === userId
+      ).length;
+      saveLocalStore(store);
+    }
+    return;
+  }
+  const remaining = await getTransactionsByFileUpload(fileUploadId, userId);
+  await db
+    .update(fileUploads)
+    .set({ transactionCount: remaining.length })
+    .where(
+      and(eq(fileUploads.id, fileUploadId), eq(fileUploads.userId, userId))
+    );
+}
+
+/**
  * Delete a file upload and all associated transactions and analyses.
  */
 export async function deleteFileUpload(fileUploadId: number, userId: number) {
@@ -792,3 +858,4 @@ export async function deleteFileUpload(fileUploadId: number, userId: number) {
       and(eq(fileUploads.id, fileUploadId), eq(fileUploads.userId, userId))
     );
 }
+

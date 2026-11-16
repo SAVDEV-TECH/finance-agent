@@ -210,4 +210,64 @@ describe('Finance Agent End-to-End tRPC Router Integration', () => {
     const remainingTxs = await caller.finance.getTransactions({ fileUploadId });
     expect(remainingTxs).toHaveLength(0);
   });
+
+  it('supports creating a blank ledger, logging live transactions with AI auto-categorization, asking the AI agent, and deleting individual transactions', async () => {
+    const caller = createTestCaller();
+
+    const ledger = await caller.finance.createLedger({
+      ledgerName: 'Dynamic November Budget',
+    });
+    expect(ledger.fileUploadId).toBeGreaterThan(0);
+
+    // Add income
+    const inc = await caller.finance.addTransaction({
+      fileUploadId: ledger.fileUploadId,
+      date: '2026-11-15',
+      description: 'STRIPE CLIENT INVOICE PAYOUT',
+      amount: 4500,
+      flowType: 'income',
+      category: 'auto',
+      account: 'Mercury Checking',
+    });
+    expect(inc.transactionType).toBe('income');
+    expect(inc.metrics.totalIncome).toBe('4500.00');
+
+    // Add expense with auto-classification
+    const exp = await caller.finance.addTransaction({
+      fileUploadId: ledger.fileUploadId,
+      date: '2026-11-16',
+      description: 'WHOLE FOODS MARKET GROCERY',
+      amount: 220.5,
+      flowType: 'expense',
+      category: 'auto',
+      account: 'Amex Gold',
+    });
+    expect(exp.category).toBe('groceries');
+    expect(exp.metrics.totalExpenses).toBe('220.50');
+    expect(exp.metrics.netCashFlow).toBe('4279.50');
+
+    // Ask the AI agent a question
+    const qa = await caller.finance.askAgent({
+      fileUploadId: ledger.fileUploadId,
+      question: 'Can I afford a $1,000 purchase right now?',
+      currencySymbol: '$',
+    });
+    expect(qa.answer).toContain('3,279.50');
+
+    // Delete the expense transaction
+    const txs = await caller.finance.getTransactions({
+      fileUploadId: ledger.fileUploadId,
+    });
+    const groceryTx = txs.find((t) => t.category === 'groceries')!;
+    const afterDel = await caller.finance.deleteTransaction({
+      transactionId: groceryTx.id,
+      fileUploadId: ledger.fileUploadId,
+    });
+    expect(afterDel.metrics.totalExpenses).toBe('0.00');
+    expect(afterDel.metrics.netCashFlow).toBe('4500.00');
+
+    // Cleanup
+    await caller.finance.deleteUpload({ fileUploadId: ledger.fileUploadId });
+  });
 });
+
